@@ -1,0 +1,92 @@
+data_dir: /var/lib/vector
+
+sources:
+  docker_logs:
+    type: docker_logs
+    include_containers: ["loggen"]
+
+transforms:
+  # First transform to handle Docker log structure
+  prepare_logs:
+    type: remap
+    inputs: ["docker_logs"]
+    source: |
+      # Remove Docker labels
+      del(.label)
+      # Extract the message and ensure it's a string
+      .message = string!(.message)
+      # Keep source information
+      .container_name = .container_name
+      .source_type = .source_type
+
+  # Second transform to parse our application JSON logs
+  parse_logs:
+    type: remap
+    inputs: ["prepare_logs"]
+    source: |
+      # Only try to parse if we have a message
+      if exists(.message) {
+        # Try to parse JSON, if it fails, keep original message
+        if is_string(.message) {
+          parsed, err = parse_json(.message)
+          if err == null {
+            # Store original metadata
+            meta = {}
+            meta = merge(meta, .)
+            
+            # Replace root with parsed data
+            . = parsed
+            
+            # Add back metadata
+            .container_name = meta.container_name
+            .source_type = meta.source_type
+            
+            # Ensure timestamp is in the correct format for Elasticsearch
+            if exists(.timestamp) {
+              ts, err = parse_timestamp(.timestamp, format: "%Y-%m-%dT%H:%M:%S.%fZ")
+              if err == null {
+                .@timestamp = format_timestamp!(ts, format: "%Y-%m-%dT%H:%M:%S.%fZ")
+                del(.timestamp)
+              }
+            }
+            
+            # Add vector metadata with correct format
+            .vector_timestamp = format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S.%fZ")
+            
+            # Ensure all fields have proper types
+            ."@metadata" = {
+              "host": string!(.metadata.host),
+              "environment": string!(.metadata.environment)
+            }
+            del(.metadata)
+            
+            # Convert fields to proper types
+            .app = string!(.app)
+            .error_type = string!(.error_type)
+            .severity = string!(.severity)
+            .request_id = string!(.request_id)
+            .user_id = string!(.user_id)
+            .message = string!(.message)
+          } else {
+            # JSON parsing failed, create structured error log
+            .parse_error = err
+            .raw_message = .message
+            .@timestamp = format_timestamp!(now(), format: "%Y-%m-%dT%H:%M:%S.%fZ")
+            .level = "error"
+            .event_type = "parse_failure"
+          }
+        }
+      }
+
+sinks:
+  elasticsearch_out:
+    type: elasticsearch
+    inputs: ["parse_logs"]
+    endpoints: ["http://elasticsearch:9200"]
+    mode: normal
+    api_version: "v7"
+    bulk:
+      index: "vector-logs-%F"
+      batch_size: 10000
+    encoding:
+      timestamp_format: "rfc3339" 
